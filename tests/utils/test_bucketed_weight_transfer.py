@@ -128,7 +128,11 @@ def test_shm_sender_writes_other_slot_while_receiver_reads(monkeypatch, tmp_path
     from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer as transfer
 
     monkeypatch.setattr(transfer, "get_torch_device", _FakeTorchDevice)
-    monkeypatch.setattr(transfer, "is_support_ipc", lambda: False)
+
+    def unexpected_ipc_query():
+        raise AssertionError("SHM cleanup should not query device IPC support")
+
+    monkeypatch.setattr(transfer, "is_support_ipc", unexpected_ipc_query)
     handle = f"ipc://{tmp_path}/weights.sock"
     sender = transfer.BucketedWeightSender(handle, bucket_size_mb=2, use_shm=True)
     receiver = transfer.BucketedWeightReceiver(handle, torch.device("cpu"), use_shm=True)
