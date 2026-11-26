@@ -20,6 +20,8 @@ and because CUDA IPC requires distinct processes.
 import asyncio
 import multiprocessing as mp
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 import torch
@@ -73,6 +75,9 @@ class _FakeTorchDevice:
     def synchronize(self):
         pass
 
+    def empty_cache(self):
+        pass
+
 
 def test_sender_accepts_strided_tensor(monkeypatch):
     from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
@@ -117,6 +122,57 @@ def test_sender_accepts_strided_tensor(monkeypatch):
     assert buffer.dtype == torch.uint8
     assert buffer.numel() == weight.nbytes
     assert torch.equal(recovered, weight)
+
+
+def test_shm_sender_writes_other_slot_while_receiver_reads(monkeypatch, tmp_path):
+    from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer as transfer
+
+    monkeypatch.setattr(transfer, "get_torch_device", _FakeTorchDevice)
+    monkeypatch.setattr(transfer, "is_support_ipc", lambda: False)
+    handle = f"ipc://{tmp_path}/weights.sock"
+    sender = transfer.BucketedWeightSender(handle, bucket_size_mb=2, use_shm=True)
+    receiver = transfer.BucketedWeightReceiver(handle, torch.device("cpu"), use_shm=True)
+    wrote_other_slot = Event()
+    received = []
+    expected = [
+        torch.full((1 << 19,), 3, dtype=torch.int16),
+        torch.full((1 << 18,), 7, dtype=torch.float32),
+        torch.full((3 << 18,), 11, dtype=torch.int16),  # Needs both slots.
+        torch.full((1 << 18,), 13, dtype=torch.float32),
+    ]
+
+    def weights():
+        for i, tensor in enumerate(expected):
+            yield str(i), tensor
+            if i == 1:
+                wrote_other_slot.set()
+
+    def consume(weights, is_last):
+        if not received:
+            # The first slot has to remain readable when the second is full.
+            assert wrote_other_slot.wait(5)
+        received.extend((name, tensor.clone()) for name, tensor in weights)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        # Timeouts let each side reclaim its resources on protocol failures.
+        init_sender = sender._init_socket
+        init_receiver = receiver._init_socket
+
+        def set_timeouts(endpoint, initialize):
+            initialize()
+            endpoint.socket.rcvtimeo = 7000
+            endpoint.socket.sndtimeo = 7000
+            endpoint.socket.linger = 0
+
+        monkeypatch.setattr(sender, "_init_socket", lambda: set_timeouts(sender, init_sender))
+        monkeypatch.setattr(receiver, "_init_socket", lambda: set_timeouts(receiver, init_receiver))
+        result = pool.submit(receiver.receive_weights, consume)
+        asyncio.run(sender.async_send_weights(weights()))
+        result.result(timeout=8)
+
+    assert [name for name, _ in received] == [str(i) for i in range(len(expected))]
+    for (_, actual), wanted in zip(received, expected, strict=True):
+        torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------

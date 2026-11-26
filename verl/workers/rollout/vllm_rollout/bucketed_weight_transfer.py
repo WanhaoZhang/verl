@@ -98,6 +98,7 @@ class BucketedWeightSender:
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._ack_pending = False
 
     async def async_send_weights(self, weights):
         """
@@ -112,38 +113,37 @@ class BucketedWeightSender:
             self._init_socket()
             self._init_buffer()
 
-            # send bucket weights
-            offset = 0
+            # Shared memory uses alternating regions of the existing mapping.
+            # Each published bucket owns its region until the receiver ACKs it.
+            pipeline = self.use_shm
+            slot_size = self.bucket_size // 2 if pipeline else self.bucket_size
+            slot_start = offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
-            # dtype = PrecisionType.to_dtype(self.config.dtype)
             async for name, weight in ensure_async_iterator(weights):
-                # model parameters are in fp32 full precision
-                # (vermouth1992) we should not force cast weight here because some parameters
-                # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
-                # the rollout should automatically cast on demand. However, this would incur a higher weight
-                # transfer volume.
-                # weight = weight.to(dtype, non_blocking=True)
-
-                # Align each tensor before the receiver views the byte buffer
-                # using that tensor's dtype.
+                # Align offsets for typed views. Keep the training dtype so
+                # parameters such as FP32 MoE gates retain their precision.
                 alignment = weight.element_size()
                 offset = (offset + alignment - 1) // alignment * alignment
-
-                # fill the tensor bucket
-                if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
-                    get_torch_device().synchronize()
-                    self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                    self.socket.recv()
+                if offset + weight.nbytes > slot_start + slot_size and bucket_meta:
+                    self._send_bucket(bucket_meta, defer_ack=pipeline)
                     bucket_meta = {}
-                    offset = 0
+                    slot_start = slot_size - slot_start if pipeline else 0
+                    offset = slot_start
 
-                if offset + weight.nbytes > self.bucket_size:
+                if weight.nbytes > self.bucket_size:
                     assert not self.use_shm, (
                         f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
                         f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
                     )
                     self._direct_send_large_weight(name, weight)
                     continue
+
+                whole_buffer = weight.nbytes > slot_size
+                if whole_buffer:
+                    # An oversized tensor uses both regions, so the receiver
+                    # must have released the previous region before we write.
+                    self._wait_for_ack()
+                    slot_start = offset = 0
 
                 bucket_meta[name] = {
                     "name": name,
@@ -156,14 +156,34 @@ class BucketedWeightSender:
                     weight, non_blocking=True
                 )
                 offset += weight.nbytes
+                if whole_buffer:
+                    self._send_bucket(bucket_meta)
+                    bucket_meta = {}
+                    offset = 0
 
-            # send the last bucket
             name = weight = None
-            get_torch_device().synchronize()
-            self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-            self.socket.recv()
+            self._send_bucket(bucket_meta, is_last=True)
+        except BaseException:
+            if self.use_shm and self.buffer is not None:
+                get_torch_device().synchronize()
+            raise
         finally:
             self._cleanup()
+
+    def _wait_for_ack(self):
+        if self._ack_pending:
+            self.socket.recv()
+            self._ack_pending = False
+
+    def _send_bucket(self, bucket_meta, *, is_last=False, defer_ack=False):
+        # Finish this slot's writes before the receiver can read it. With
+        # split SHM the receiver can still be reading the other slot here.
+        get_torch_device().synchronize()
+        self._wait_for_ack()
+        self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": is_last})
+        self._ack_pending = True
+        if not defer_ack:
+            self._wait_for_ack()
 
     def _init_socket(self):
         """Initialize ZMQ REQ socket and bind."""
@@ -188,7 +208,7 @@ class BucketedWeightSender:
 
             # Create unique name for shared memory
             shm_name = f"verl_weights_{uuid.uuid4().hex}"
-            shm = create_shared_memory(self.bucket_size, shm_name)
+            shm = self.shm = create_shared_memory(self.bucket_size, shm_name)
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
 
             comm_metadata = {"name": shm_name, "size": self.bucket_size}
@@ -209,6 +229,7 @@ class BucketedWeightSender:
                 os.remove(ipc_path)
             except OSError:
                 pass
+        self._ack_pending = False
         del self.buffer
         self.buffer = None
         if self.shm is not None:
